@@ -1,14 +1,29 @@
 import os
 import logging
+import re
 from geopy.geocoders import Nominatim
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from math import radians, cos, sin, sqrt, atan2
 
+# Optional Google Maps import
+try:
+    import googlemaps  # type: ignore
+except ImportError:
+    googlemaps = None
+
+# Environment variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CITY_HINT = os.getenv("CITY_HINT")
+GMAPS_KEY = os.getenv("GOOGLE_MAPS_KEY")
+GEOCODER_PREF = os.getenv("GEOCODER_PREF", "any").lower()
 
+# Initialize geocoders
 geolocator = Nominatim(user_agent="be_route_bot")
+gmaps = googlemaps.Client(key=GMAPS_KEY) if GMAPS_KEY and googlemaps else None
+
+# Coordinate regex for detecting "lat, lon" input
+coord_rx = re.compile(r"^\s*(-?\d{1,2}\.\d+)[,\s]+(-?\d{1,3}\.\d+)\s*$")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a welcome message and instructions."""
@@ -36,18 +51,62 @@ async def depot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["depot"] = (lat, lon)
     await update.message.reply_text(f"Depósito establecido en ({lat:.5f}, {lon:.5f}). Envía las direcciones para optimizar.")
 
+
 def geocode(address: str):
-    """Geocode an address using Nominatim."""
+    """
+    Geocode an address or coordinate string.
+
+    1. Detect if the input looks like a pair of latitude/longitude coordinates
+       (e.g. "20.56912,-100.42088"). If so, it returns those values directly.
+    2. Otherwise, it will append the CITY_HINT to the query if not already present
+       and attempt to geocode using OpenStreetMap's Nominatim.
+    3. If Nominatim fails and a valid Google Maps API key is configured, it
+       will attempt to geocode using Google. The order of geocoders can be
+       controlled via the GEOCODER_PREF environment variable.
+
+    :param address: The address or coordinate string to geocode.
+    :returns: A tuple of (latitude, longitude).
+    :raises ValueError: If no geocoder returns a result.
+    """
+    # 1. Check coordinates
+    match = coord_rx.match(address)
+    if match:
+        lat = float(match.group(1))
+        lon = float(match.group(2))
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return (lat, lon)
+    # 2. Append city hint if needed
     query = address
     if CITY_HINT and CITY_HINT.lower() not in address.lower():
         query = f"{address}, {CITY_HINT}"
-    location = geolocator.geocode(query, timeout=10)
-    if not location:
-        raise ValueError("Dirección no encontrada.")
-    return (location.latitude, location.longitude)
+    # Determine order
+    if GEOCODER_PREF == "google":
+        order = ["google", "osm"]
+    elif GEOCODER_PREF == "osm":
+        order = ["osm", "google"]
+    else:
+        order = ["osm", "google"]
+    # Try geocoders
+    for which in order:
+        if which == "osm":
+            try:
+                location = geolocator.geocode(query, timeout=10)
+            except Exception:
+                location = None
+            if location:
+                return (location.latitude, location.longitude)
+        if which == "google" and gmaps:
+            try:
+                results = gmaps.geocode(query, region="mx")
+            except Exception:
+                results = None
+            if results:
+                loc = results[0]["geometry"]["location"]
+                return (loc["lat"], loc["lng"])
+    raise ValueError("Dirección no encontrada.")
+
 
 def haversine(coord1, coord2):
-    """Calculate the great-circle distance between two points."""
     R = 6371.0
     lat1, lon1 = coord1
     lat2, lon2 = coord2
@@ -57,15 +116,15 @@ def haversine(coord1, coord2):
     a = sin(dphi / 2)**2 + cos(phi1) * cos(phi2) * sin(dlambda / 2)**2
     return 2 * R * atan2(sqrt(a), sqrt(1 - a))
 
+
 def route_distance(route, points):
-    """Compute the total distance of a route."""
     dist = 0
     for i in range(len(route) - 1):
         dist += haversine(points[route[i]], points[route[i + 1]])
     return dist
 
+
 def nearest_neighbor(points, start_index=0):
-    """Produce an initial route using a nearest neighbor heuristic."""
     unvisited = list(range(len(points)))
     path = [start_index]
     unvisited.remove(start_index)
@@ -77,8 +136,8 @@ def nearest_neighbor(points, start_index=0):
         current = next_idx
     return path
 
+
 def two_opt(route, points):
-    """Improve a route using the 2-opt algorithm."""
     best = route
     improved = True
     while improved:
@@ -94,8 +153,8 @@ def two_opt(route, points):
         route = best
     return best
 
+
 def build_maps_links(points):
-    """Build Google Maps directions links in chunks."""
     links = []
     base = "https://www.google.com/maps/dir/?api=1"
     chunk_size = 10
@@ -111,22 +170,19 @@ def build_maps_links(points):
         links.append(url)
     return links
 
+
 async def handle_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process a message containing multiple addresses and return an optimized route."""
     if "depot" not in context.user_data:
         await update.message.reply_text("Primero establece un depósito con /depot o compartiendo tu ubicación.")
         return
-
     text = update.message.text.strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     points = []
     labels = []
-
-    # Add depot as first point
+    # Add depot first
     points.append(context.user_data["depot"])
     labels.append("Depósito")
-
-    # Geocode each provided address
+    # Geocode each provided line
     for line in lines:
         try:
             lat, lon = geocode(line)
@@ -135,26 +191,19 @@ async def handle_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception as e:
             await update.message.reply_text(f"No se pudo geocodificar {line}: {e}")
             return
-
-    # Generate initial route and optimize it
     route = nearest_neighbor(points, 0)
     optimized = two_opt(route, points)
-
-    # Build response text
     order_lines = []
     for idx, stop_idx in enumerate(optimized):
         order_lines.append(f"{idx + 1}. {labels[stop_idx]}")
     response = "Orden de paradas optimizado:\n" + "\n".join(order_lines)
-
-    # Build Google Maps directions links
     maps_links = build_maps_links([points[i] for i in optimized])
     for i, link in enumerate(maps_links):
         response += f"\n\nTramo {i + 1}: {link}"
-
     await update.message.reply_text(response)
 
+
 def main():
-    """Start the Telegram bot."""
     logging.basicConfig(level=logging.INFO)
     if not TOKEN:
         raise RuntimeError("Debe definir la variable de entorno TELEGRAM_TOKEN.")
@@ -164,6 +213,7 @@ def main():
     app.add_handler(MessageHandler(filters.LOCATION, depot))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_addresses))
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
