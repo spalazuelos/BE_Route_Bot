@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: be-route-bot
+    env: python
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python be_route_bot.py
