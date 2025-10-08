@@ -1,0 +1,14 @@
+[Unit]
+Description=Be Route Bot Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/be-route-bot
+ExecStart=/usr/bin/python3 /opt/be-route-bot/be_route_bot.py
+Environment=TELEGRAM_TOKEN=your_token_here
+Environment=CITY_HINT=CDMX
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
