@@ -1,2 +1,3 @@
 python-telegram-bot==20.6
 geopy==2.4.1
+googlemaps==4.10.0
